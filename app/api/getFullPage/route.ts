@@ -2,46 +2,53 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import puppeteer from 'puppeteer';
+import fs from 'fs';
+import path from 'path';
 
-/**
- * Simple sanitizer for the `href` fragment that will be appended to:
- *  https://connect.pierapps.com/${href}
- *
- * Allowed characters: letters, digits, -, _, / .
- * Reject if contains protocol, host, backreferences, or suspicious patterns.
- */
+/* sanitizeHref unchanged - keep your function */
 function sanitizeHref(raw?: string | null): string | null {
   if (!raw) return null;
-
   const trimmed = raw.trim();
-
-  // Disallow absolute URLs, protocol, or leading double slashes
   if (/^https?:\/\//i.test(trimmed) || /^\/\//.test(trimmed)) return null;
-
-  // Disallow parent-traversal segments
   if (trimmed.includes('..')) return null;
-
-  // Only allow a safe subset of characters commonly found in path segments
-  // and require at least one non-empty segment
   if (!/^[A-Za-z0-9\-_.\/]+$/.test(trimmed)) return null;
-
-  // Prevent starting with a slash to keep behavior predictable; allow if user included it
   const normalized = trimmed.replace(/^\/+/, '');
-
-  // limit length to prevent abuse
   if (normalized.length === 0 || normalized.length > 200) return null;
-
   return normalized;
+}
+
+/** Look for common chrome/chromium executable paths on linux/mac/windows (synchronous) */
+function findChromeExecutable(): string | null {
+  const candidates = [
+    // common Linux
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+    // common Debian pkg path
+    '/usr/local/bin/chromium',
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    // Windows (WSL / path style)
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {
+      // ignore errors checking paths
+    }
+  }
+  return null;
 }
 
 export async function GET(req: NextRequest) {
   try {
-    // Read href from query param ?href=widgets/agencies/982
     const { searchParams } = new URL(req.url);
     const hrefParam = searchParams.get('href');
-
-    // Optional: if you decide to change route to a catch-all route,
-    // you could read the path segments instead. For now we use query param.
     const safeHref = sanitizeHref(hrefParam);
 
     if (!safeHref) {
@@ -53,32 +60,73 @@ export async function GET(req: NextRequest) {
 
     const target = `https://connect.pierapps.com/${safeHref}`;
 
-    // Launch puppeteer - add common args for linux/container environments.
-    // If deploying to serverless you may need chrome-aws-lambda or a remote browser instead.
-    const browser = await puppeteer.launch({
+    // Launch options common for containerized environments
+    const baseLaunchOptions: Parameters<typeof puppeteer.launch>[0] = {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      // Uncomment and set executablePath if you need a specific chrome binary:
-      // executablePath: process.env.CHROME_PATH || undefined,
-    });
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+      // dev: set product if needed: product: 'chrome' or 'firefox'
+    };
+
+    let browser;
+    let launchError: any = null;
+
+    // First attempt: normal launch (this will use whatever chromium puppeteer manages)
+    try {
+      browser = await puppeteer.launch({ ...baseLaunchOptions });
+    } catch (err) {
+      launchError = err;
+    }
+
+    // If first attempt failed, try to find a system chrome and relaunch with executablePath
+    if (!browser) {
+      const envPath = process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
+      const candidate = envPath || findChromeExecutable();
+      if (candidate) {
+        try {
+          browser = await puppeteer.launch({
+            ...baseLaunchOptions,
+            executablePath: candidate,
+          });
+        } catch (err) {
+          launchError = err;
+        }
+      }
+    }
+
+    // If still no browser, respond with a helpful error pointing to remediation steps
+    if (!browser) {
+      console.error('Puppeteer launch failed:', launchError);
+      const details = [
+        'Puppeteer could not find a Chromium/Chrome binary to run.',
+        'If you are running locally, run: `npx puppeteer browsers install chrome` or reinstall node_modules.',
+        'If you are in Docker/CI, install chromium in your image and set the CHROME_PATH env var to the binary path.',
+        'If you are on serverless (Vercel/Lambda) you should use puppeteer-core + a compatible chromium build (e.g. chrome-aws-lambda) or Playwright and follow their deployment guides.',
+        `Error message: ${
+          (launchError && launchError.message) || String(launchError)
+        }`,
+      ].join(' ');
+      return NextResponse.json(
+        { success: false, error: 'Scraping failed', details },
+        { status: 500 },
+      );
+    }
 
     let page;
     try {
       page = await browser.newPage();
-
-      // Optional: set user agent & viewport to mimic a desktop browser
       await page.setUserAgent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
           '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       );
       await page.setViewport({ width: 1366, height: 768 });
 
-      // Navigate with a sensible timeout and waitUntil strategy
       await page.goto(target, { waitUntil: 'networkidle2', timeout: 30_000 });
 
-      // Example extraction: gather visible text nodes with length > 40 (same as your original)
       const data = await page.evaluate(() => {
-        // Find visible text in the document
         const nodes = Array.from(document.querySelectorAll('body *'));
         return nodes
           .map((el) => el.textContent?.trim())
@@ -87,17 +135,12 @@ export async function GET(req: NextRequest) {
 
       return NextResponse.json({ success: true, count: data.length, data });
     } finally {
-      // ensure page/browser closed in every scenario
       try {
         if (page && !page.isClosed()) await page.close();
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
       try {
         if (browser) await browser.close();
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
   } catch (error) {
     console.error('Scrape API error:', error);
